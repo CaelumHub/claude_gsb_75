@@ -7,6 +7,7 @@ way the UI touches the node, keeping the consensus core free of web concerns.
 
 import os
 import time
+import json
 
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -14,7 +15,7 @@ from flask_cors import CORS
 from . import crypto
 from .state import ZERO_ADDRESS
 from .storage import read_json, atomic_write_json
-from .transaction import Transaction
+from .transaction import Transaction, create_deploy
 from .templates import template_catalog, get_template, TEMPLATES
 
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(
@@ -458,6 +459,76 @@ def create_app(node):
         return read_json(os.path.join(node.paths.root,
                                       "custom_templates.json"), [])
 
+    def _resolve_template(name):
+        """Return the built-in or custom template dict for ``name``."""
+        t = get_template(name)
+        if t:
+            return t
+        return next((c for c in _custom_templates()
+                     if c.get("name") == name), None)
+
+    def _coerce_constructor(args, spec):
+        """Validate/coerce constructor ``args`` against the template's spec.
+
+        Returns ``(coerced, None)`` or ``(None, error_message)``.  The same
+        coercion is applied to the dry-run and to the prepared deploy tx, so
+        the previewed init() is exactly the one that will run on deployment.
+        """
+        if spec is None:
+            # No declared constructor (e.g. raw code): pass args through.
+            return args, None
+        spec = spec or []
+        if not isinstance(args, list):
+            return None, "构造参数必须是数组"
+        if len(args) != len(spec):
+            return None, (f"参数数量不匹配：模板需要 {len(spec)} 个参数"
+                          f"（{', '.join(c.get('name', '?') for c in spec)}），"
+                          f"实际传入 {len(args)} 个")
+        coerced = []
+        for value, param in zip(args, spec):
+            pname = param.get("name", "?")
+            ptype = param.get("type", "")
+            try:
+                if ptype == "int":
+                    # Accept ints and integral floats; reject 1.5 silently
+                    # truncating and reject strings like "abc" up front.
+                    if isinstance(value, bool):
+                        raise ValueError
+                    if isinstance(value, str):
+                        value = value.strip()
+                        n = int(value)
+                    elif isinstance(value, float):
+                        if not value.is_integer():
+                            raise ValueError
+                        n = int(value)
+                    elif isinstance(value, int):
+                        n = value
+                    else:
+                        raise ValueError
+                    coerced.append(n)
+                elif ptype == "string":
+                    coerced.append(str(value))
+                elif ptype == "address":
+                    text = str(value)
+                    if not crypto.is_valid_address(text):
+                        return None, f"参数 {pname} 不是合法地址（需 0x 开头 40 位十六进制）"
+                    coerced.append(text)
+                elif ptype == "list":
+                    if isinstance(value, str):
+                        parsed = json.loads(value)
+                    else:
+                        parsed = value
+                    if not isinstance(parsed, list):
+                        return None, f"参数 {pname} 必须是列表"
+                    coerced.append(parsed)
+                else:
+                    coerced.append(value)
+            except (ValueError, TypeError):
+                return None, f"参数 {pname} 需要 {ptype or '合法'} 类型的值"
+            except json.JSONDecodeError:
+                return None, f"参数 {pname} 不是合法的列表 JSON"
+        return coerced, None
+
     @app.get("/api/templates")
     def templates_list():
         custom = _custom_templates()
@@ -501,6 +572,108 @@ def create_app(node):
         atomic_write_json(os.path.join(node.paths.root,
                                        "custom_templates.json"), custom)
         return _json({"ok": True, "name": name})
+
+    @app.post("/api/templates/preview")
+    def template_preview():
+        """Dry-run a templated deployment and predict its on-chain result.
+
+        Body: ``{template?, code?, args, sender, fee}``.  The init entry point
+        is executed against an isolated copy of the current world state — no
+        transaction, pool entry, or state mutation is created.  When the sender
+        owns a local wallet, the exact signed deploy transaction is returned in
+        ``prepared_tx`` so the subsequent real deploy derives the *same* address
+        and commits the *same* initial storage, events and transfers.
+        """
+        data = request.get_json(force=True, silent=True) or {}
+        sender = data.get("sender")
+        if not crypto.is_valid_address(sender):
+            return _json({"ok": False, "stage": "params",
+                          "error": "invalid sender"}, 400)
+        try:
+            fee = float(data.get("fee", 0))
+        except (TypeError, ValueError):
+            return _json({"ok": False, "stage": "params",
+                          "error": "手续费必须是数字"}, 400)
+        if fee < 0:
+            return _json({"ok": False, "stage": "params",
+                          "error": "手续费不能为负"}, 400)
+
+        # Resolve source code and constructor spec (built-in or custom).
+        template = None
+        if data.get("template"):
+            template = _resolve_template(data["template"])
+            if not template:
+                return _json({"ok": False, "stage": "params",
+                              "error": f"模板不存在: {data['template']}"}, 404)
+        code = data.get("code")
+        if not code and template:
+            code = template.get("source", "")
+        if not code:
+            return _json({"ok": False, "stage": "params",
+                          "error": "缺少合约源码或模板名"}, 400)
+
+        spec = template.get("constructor") if template else None
+        args, err = _coerce_constructor(data.get("args", []), spec)
+        if err:
+            return _json({"ok": False, "stage": "params", "error": err})
+
+        bc = node.blockchain
+        state = bc.state
+        warnings = []
+
+        # Mirror txpool admission checks so problems are reported *now*, before
+        # the user pays the fee / mines a block on a doomed deployment.
+        pending = node.txpool.all()
+        if any(tx.sender == sender for tx in pending):
+            warnings.append("该账户已有一笔待确认交易，请先出块确认后再部署，"
+                            "否则本次部署将被交易池拒绝（nonce 已被占用）")
+        if state.balance(sender) < fee:
+            return _json({"ok": False, "stage": "params",
+                          "error": f"账户余额 {state.balance(sender)} 不足以支付"
+                                   f"手续费 {fee}"})
+
+        # Build the deploy tx exactly as a real deployment would.  When the
+        # wallet is local we sign it now; the same tx is reused on deploy so
+        # the address/txid predicted here stay valid.
+        constructor = args if spec is not None else (args or None)
+        tx = create_deploy(sender, code, fee, state.nonce(sender),
+                           constructor=constructor)
+        local_wallet = node.wallets.has(sender)
+        if local_wallet:
+            priv = node.wallets.private_key(sender)
+            tx.sign_with(priv)
+        else:
+            warnings.append("部署账户不在本节点钱包中：已给出预测结果，但无法生成"
+                            "可直接提交的已签名部署交易")
+        address = bc._contract_address(tx)
+
+        # Static validation + a full init() dry-run on an isolated state copy.
+        sim = bc.engine.simulate_deploy(
+            code, sender, address, state,
+            constructor=constructor, height=bc.height + 1)
+        if not sim["ok"]:
+            return _json({"ok": False, "stage": "execution",
+                          "error": sim["error"], "address": address,
+                          "txid": tx.txid})
+
+        storage = sim.get("storage", {})
+        payload = {
+            "ok": True,
+            "template": template.get("name") if template else None,
+            "address": address,
+            "txid": tx.txid,
+            "fee": fee,
+            "height": bc.height + 1,
+            "args": constructor,
+            "storage": storage,
+            "storage_keys": len(storage),
+            "events": sim.get("events", []),
+            "transfers": sim.get("transfers", []),
+            "output": sim.get("output", ""),
+            "warnings": warnings,
+            "prepared_tx": tx.to_dict() if local_wallet else None,
+        }
+        return _json(payload)
 
     # ================================================================== #
     # Stats

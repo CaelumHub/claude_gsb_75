@@ -230,11 +230,17 @@ def exec_restricted(code, context, instruction_budget=200_000, output_limit=50_0
     return result
 
 
-def call_function(code, function_name, args, context, **kwargs):
-    """Execute source, then call ``function_name(*args)`` inside the sandbox."""
+def call_function(code, function_name, args, context, optional=False, **kwargs):
+    """Execute source, then call ``function_name(*args)`` inside the sandbox.
+
+    With ``optional=True`` a missing function is not an error: the module-level
+    code has already run, so the call is reported as successful with
+    ``function_found=False`` (used by deploy to stay compatible with contracts
+    written as bare module-level code).
+    """
     out = OutputBuffer(kwargs.get("output_limit", 50_000))
     result = {"ok": False, "output": "", "error": None, "instructions": 0,
-              "return": None}
+              "return": None, "function_found": True}
 
     ok, msg = validate_source(code)
     if not ok:
@@ -252,7 +258,11 @@ def call_function(code, function_name, args, context, **kwargs):
         exec(compiled, env, env)
         func = env.get(function_name)
         if not callable(func):
-            result["error"] = f"function '{function_name}' not found in contract"
+            if optional:
+                result["function_found"] = False
+                result["ok"] = True
+            else:
+                result["error"] = f"function '{function_name}' not found in contract"
         else:
             result["return"] = func(*args)
             result["ok"] = True

@@ -32,6 +32,25 @@
           <div id="detailBody" class="small" style="line-height:1.8;">
             <div class="empty">👈 从左侧选择一个模板查看详情</div>
           </div>
+
+          <div id="previewWrap" style="display:none;margin-top:14px;">
+            <hr class="divider">
+            <div class="section-title">参数模拟预览</div>
+            <p class="hint" style="margin:6px 0;">填入参数后先模拟运行：查看初始状态、事件与转账，或提前发现会导致部署失败的参数问题。可反复调整预览，满意后再确认部署。</p>
+            <div id="previewArgs"></div>
+            <div class="row">
+              <div class="field" style="flex:1.4;"><label>部署账户（本地钱包）</label>
+                <select id="pvFrom"></select></div>
+              <div class="field" style="flex:.6;"><label>手续费</label>
+                <input id="pvFee" type="number" min="0" step="any" value="0"></div>
+            </div>
+            <div class="flex">
+              <button class="btn primary sm" onclick="runPreview()">🔍 模拟预览</button>
+              <button class="btn ghost sm" onclick="deployTpl(currentTemplateName)">🚀 旧版一键部署（跳转部署页）</button>
+            </div>
+            <div id="previewResult" style="margin-top:12px;"></div>
+          </div>
+
           <div id="detailSource" style="margin-top:12px;"></div>
         </div>
       </div>
@@ -54,14 +73,32 @@
 
 <script src="/static/js/api.js"></script>
 <script src="/static/js/app.js"></script>
+<script src="/static/js/preview.js"></script>
 <script>
 window.PAGE = "templates";
 let catalog = [];
 let current = null;
+let currentTemplate = null;
+let currentTemplateName = null;
+let wallets = [];
 
 async function init() {
-  await loadTemplates();
+  await Promise.all([loadTemplates(), loadWallets()]);
   pollStatus(10000);
+}
+
+async function loadWallets() {
+  const d = await API.get("/api/wallet/list");
+  wallets = d.wallets;
+}
+
+function walletOptions() {
+  if (!wallets.length) {
+    return `<option value="">（本机暂无钱包，请先到钱包管理创建）</option>`;
+  }
+  return wallets.map((w, i) =>
+    `<option value="${i}">${esc(w.label || fmt.addr(w.address, 6))} (${fmt.amount(w.balance)})</option>`
+  ).join("");
 }
 
 async function loadTemplates() {
@@ -92,6 +129,9 @@ async function selectTpl(name) {
   loadTemplates(); // refresh active highlight
   const d = await API.get("/api/templates/" + name);
   const t = d.template;
+  currentTemplate = t;
+  currentTemplateName = t.name;
+  await loadWallets();
   $("#detailTitle").textContent = t.title;
   const ctor = (t.constructor || []).map(c =>
     `${c.name}:${c.type}（${c.desc || ""}）`).join("、");
@@ -102,11 +142,61 @@ async function selectTpl(name) {
     <div><span class="muted">函数：</span>${t.functions.map(f => `<span class="mono">${esc(f.name)}</span>`).join(" · ")}</div>
     <div style="margin-top:8px;"><span class="muted">描述：</span>${esc(t.description)}</div>
     <div class="flex" style="margin-top:12px;">
-      <button class="btn green sm" onclick="deployTpl('${esc(t.name)}')">🚀 部署此模板</button>
       <button class="btn ghost sm" onclick="copySource()">📋 复制源码</button>
     </div>`;
   $("#detailSource").innerHTML = `<div class="section-title">源码</div>
     <pre class="code" style="max-height:280px;">${esc(t.source)}</pre>`;
+
+  // Set up the typed preview form for this template.
+  $("#previewWrap").style.display = "";
+  $("#pvFrom").innerHTML = walletOptions();
+  Preview.renderFields($("#previewArgs"), t.constructor || []);
+  $("#previewResult").innerHTML =
+    `<div class="hint">填好参数后点击「模拟预览」查看部署结果。</div>`;
+}
+
+async function runPreview() {
+  if (!currentTemplate) return;
+  const idx = Number($("#pvFrom").value);
+  if (!wallets[idx]) return toast("请先选择本机部署钱包", "err");
+  const collected = Preview.collectArgs($("#previewArgs"));
+  if (collected.error) return toast(collected.error, "err");
+  const fee = parseFloat($("#pvFee").value || 0);
+  if (isNaN(fee) || fee < 0) return toast("手续费非法", "err");
+  const box = $("#previewResult");
+  box.innerHTML = `<div class="hint">⏳ 正在隔离状态中模拟运行 init()…</div>`;
+  try {
+    const r = await Preview.request({
+      template: currentTemplate.name,
+      sender: wallets[idx].address, fee, args: collected.args,
+    });
+    Preview.render(box, r, confirmDeploy);
+  } catch (e) {
+    box.innerHTML = `<span class="badge red">✗ 预览请求失败：${esc(e.message)}</span>`;
+  }
+}
+
+async function confirmDeploy(preview) {
+  if (!preview.prepared_tx) return;
+  if (!confirm("确认将该模板以最后一次预览的参数部署上链？\n" +
+               "部署后合约初始状态与预览完全一致。")) return;
+  try {
+    const d = await Preview.deployPrepared(preview.prepared_tx);
+    if (d.ok) {
+      toast("部署交易已提交，合约地址 " + fmt.addr(preview.address, 8), "ok");
+      toast("请到交易池页面出块确认部署", "info");
+      // The sender now has a pending tx; refresh balance and re-preview hint.
+      await loadWallets();
+      $("#pvFrom").innerHTML = walletOptions();
+      $("#pvFrom").value = wallets.findIndex(
+        (w) => w.address === preview.prepared_tx.sender);
+      runPreview();
+    } else {
+      toast(d.reason || "部署被拒绝（可能 nonce 已变化，请重新预览）", "err");
+    }
+  } catch (e) {
+    toast(e.message + "（请重新预览后再部署）", "err");
+  }
 }
 
 function deployTpl(name) {

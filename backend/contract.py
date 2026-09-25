@@ -170,10 +170,16 @@ class ContractEngine:
             world_state, address, creator, 0, height)
         ctx = {k: v for k, v in context.items()}
 
-        if constructor:
-            # Expect an ``init`` function taking the constructor args.
+        if constructor is not None:
+            # Call ``init`` with the constructor args.  An *empty* list still
+            # means "call init() with no args"; only None means there is no
+            # constructor at all.  Contracts written as bare module-level code
+            # (no init) are still supported via the optional fallback.
             res = call_function(code, "init", list(constructor), ctx,
-                                output_limit=self.max_print)
+                                optional=True, output_limit=self.max_print)
+            if res.get("ok") and res.get("function_found") is False:
+                # Module-level code already ran during exec; nothing else to do.
+                pass
         else:
             res = exec_restricted(code, ctx, output_limit=self.max_print)
 
@@ -219,3 +225,22 @@ class ContractEngine:
         snapshot = world_state.copy()
         return self.invoke(contract_addr, function, args, sender, 0,
                            snapshot, height)
+
+    def simulate_deploy(self, code, creator, address, world_state,
+                        constructor=None, height=0):
+        """Dry-run a deployment against a *copy* of ``world_state``.
+
+        Uses exactly the same :meth:`deploy` code path as a real block
+        application, so the reported initial storage, events and transfers are
+        what the actual deployment will produce.  Nothing is committed; the
+        caller's state is left untouched.
+        """
+        snapshot = world_state.copy()
+        result = self.deploy(code, creator, address, snapshot,
+                             constructor=constructor, height=height)
+        if result.get("ok"):
+            # ``storage`` is already a deep copy in ``deploy``; the snapshot
+            # (and any balance changes from init-time transfers) is discarded.
+            result["transfers"] = copy.deepcopy(result.get("transfers", []))
+            result["events"] = copy.deepcopy(result.get("events", []))
+        return result

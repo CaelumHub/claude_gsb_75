@@ -50,8 +50,12 @@ def get():
             <input id="constructor" class="mono" placeholder='例如 ["MyToken","MT",1000]'></div>
           <div class="field"><label>手续费</label>
             <input id="deployFee" type="number" min="0" step="any" value="0"></div>
-          <button class="btn green" onclick="deploy()" style="width:100%;">🚀 部署合约</button>
-          <div class="hint" style="margin-top:10px;">部署后合约地址由交易ID确定性推导，可在「合约交互」页面调用。</div>
+          <div class="flex">
+            <button class="btn primary" onclick="previewDeploy()" style="flex:1;">🔍 模拟预览</button>
+            <button class="btn green" onclick="deploy()" style="flex:1;">🚀 部署合约</button>
+          </div>
+          <div id="deployPreview" style="margin-top:12px;"></div>
+          <div class="hint" style="margin-top:10px;">建议先「模拟预览」检查初始状态、事件与转账；部署后合约地址由交易ID确定性推导，可在「合约交互」页面调用。</div>
           <hr class="divider">
           <div class="section-title">沙箱安全模型</div>
           <div class="small muted" style="line-height:1.9;">
@@ -74,9 +78,11 @@ def get():
 
 <script src="/static/js/api.js"></script>
 <script src="/static/js/app.js"></script>
+<script src="/static/js/preview.js"></script>
 <script>
 window.PAGE = "deploy";
 let wallets = [];
+let loadedTemplateName = null;
 
 async function init() {
   await loadWallets();
@@ -92,15 +98,20 @@ async function init() {
 async function autoLoadTemplate(name) {
   try {
     const t = await API.get("/api/templates/" + name);
-    $("#editor").textContent = t.template.source;
-    const ctor = t.template.constructor;
-    if (ctor.length) {
-      $("#constructor").value = "[" + ctor.map(c =>
-        c.type === "int" ? "0" : '""').join(",") + "]";
-      $("#constructor").title = "参数: " + ctor.map(c => c.name).join(", ");
-    } else $("#constructor").value = "[]";
+    applyTemplate(name, t.template);
     toast("已载入模板: " + t.template.title, "ok");
   } catch (e) { toast("模板载入失败", "err"); }
+}
+
+function applyTemplate(name, t) {
+  loadedTemplateName = name;
+  $("#editor").textContent = t.source;
+  const ctor = t.constructor;
+  if (ctor.length) {
+    $("#constructor").value = "[" + ctor.map(c =>
+      c.type === "int" ? "0" : '""').join(",") + "]";
+    $("#constructor").title = "参数: " + ctor.map(c => c.name).join(", ");
+  } else $("#constructor").value = "[]";
 }
 
 async function loadWallets() {
@@ -126,14 +137,48 @@ async function loadTemplate() {
   if (idx == null) return;
   const name = d.templates[idx].name;
   const t = await API.get("/api/templates/" + name);
-  $("#editor").textContent = t.template.source;
-  const ctor = t.template.constructor;
-  if (ctor.length) {
-    $("#constructor").value = "[" + ctor.map(c =>
-      c.type === "int" ? "0" : '""').join(",") + "]";
-    $("#constructor").title = "参数: " + ctor.map(c => c.name).join(", ");
-  } else $("#constructor").value = "[]";
+  applyTemplate(name, t.template);
   toast("已载入模板: " + t.template.title, "ok");
+}
+
+async function previewDeploy() {
+  const idx = Number($("#deployFrom").value);
+  if (!wallets[idx]) return toast("请先生成钱包", "err");
+  const parsed = Preview.readJsonArgs($("#constructor"));
+  if (parsed.error) return toast(parsed.error, "err");
+  const fee = parseFloat($("#deployFee").value || 0);
+  if (isNaN(fee) || fee < 0) return toast("手续费非法", "err");
+  const box = $("#deployPreview");
+  box.innerHTML = `<div class="hint">⏳ 正在隔离状态中模拟运行 init()…</div>`;
+  try {
+    // Send the (possibly edited) code explicitly; the template name still
+    // drives constructor-spec validation for typed, friendly param errors.
+    const r = await Preview.request({
+      template: loadedTemplateName || undefined,
+      code: code(),
+      sender: wallets[idx].address, fee, args: parsed.args,
+    });
+    Preview.render(box, r, confirmPreviewDeploy);
+  } catch (e) {
+    box.innerHTML = `<span class="badge red">✗ 预览请求失败：${esc(e.message)}</span>`;
+  }
+}
+
+async function confirmPreviewDeploy(preview) {
+  if (!confirm("确认按最后一次预览的参数部署上链？\n部署后合约初始状态与预览完全一致。")) return;
+  try {
+    const d = await Preview.deployPrepared(preview.prepared_tx);
+    if (d.ok) {
+      toast("部署交易已提交，合约地址 " + fmt.addr(preview.address, 8), "ok");
+      toast("请到交易池页面出块确认部署", "info");
+      await loadWallets();
+      await loadContracts();
+    } else {
+      toast(d.reason || "部署被拒绝（可能 nonce 已变化，请重新预览）", "err");
+    }
+  } catch (e) {
+    toast(e.message + "（请重新预览后再部署）", "err");
+  }
 }
 
 function chooseFrom(items) {
