@@ -12,6 +12,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 from . import crypto
+from .config import CONTRACT_ADDR_PREFIX
 from .state import ZERO_ADDRESS
 from .storage import read_json, atomic_write_json
 from .transaction import Transaction
@@ -365,6 +366,55 @@ def create_app(node):
         data = request.get_json(force=True, silent=True) or {}
         ok, msg = validate_source(data.get("code", ""))
         return _json({"ok": ok, "message": msg})
+
+    @app.post("/api/contract/simulate_deploy")
+    def contract_simulate_deploy():
+        """Dry-run a deployment on a snapshot of the world state.
+
+        Runs the exact engine path a real deployment takes
+        (:meth:`ContractEngine.deploy`) against a *copy* of the current
+        state, so callers can preview the initial storage, events and
+        transfers the constructor would produce — and see parameter
+        errors — before committing a deploy transaction.  The preview
+        never mutates the chain and can be repeated freely; a real deploy
+        with the same code/params/sender reproduces the previewed state.
+        """
+        data = request.get_json(force=True, silent=True) or {}
+        code = data.get("code", "")
+        constructor = data.get("constructor")
+        if constructor is not None and not isinstance(constructor, list):
+            return _json({"ok": False, "preview": True,
+                          "error": "constructor must be a JSON array"}, 400)
+        try:
+            fee = float(data.get("fee", 0) or 0)
+        except (TypeError, ValueError):
+            return _json({"ok": False, "preview": True,
+                          "error": "invalid fee"}, 400)
+        sender = data.get("sender")
+        if not crypto.is_valid_address(sender):
+            # No wallet selected yet: preview with the zero address as sender.
+            sender = ZERO_ADDRESS
+        bc = node.blockchain
+        snapshot = bc.state.copy()
+        # Mirror the balance check a real deploy performs before running
+        # init, so an unaffordable fee is reported at preview time too.
+        if sender != ZERO_ADDRESS and snapshot.balance(sender) < fee:
+            return _json({
+                "ok": False, "preview": True,
+                "error": (f"余额不足以支付部署手续费: 需要 {fee}, "
+                          f"账户当前余额 {snapshot.balance(sender)}"),
+                "events": [], "transfers": [], "storage": {},
+            })
+        # The real contract address derives from the deploy txid (unknown
+        # until the transaction is signed), so the preview runs under a
+        # deterministic placeholder address.
+        preview_address = CONTRACT_ADDR_PREFIX + "0" * 40
+        result = bc.engine.deploy(code, sender, preview_address, snapshot,
+                                  constructor=constructor,
+                                  height=bc.height + 1)
+        result["preview"] = True
+        result["height"] = bc.height + 1
+        return _json(result)
 
     @app.post("/api/contract/deploy")
     def contract_deploy():

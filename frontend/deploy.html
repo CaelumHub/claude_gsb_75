@@ -50,8 +50,10 @@ def get():
             <input id="constructor" class="mono" placeholder='例如 ["MyToken","MT",1000]'></div>
           <div class="field"><label>手续费</label>
             <input id="deployFee" type="number" min="0" step="any" value="0"></div>
-          <button class="btn green" onclick="deploy()" style="width:100%;">🚀 部署合约</button>
-          <div class="hint" style="margin-top:10px;">部署后合约地址由交易ID确定性推导，可在「合约交互」页面调用。</div>
+          <button class="btn primary" onclick="simulateDeploy()" style="width:100%;">🔍 模拟预览（不上链）</button>
+          <button class="btn green" onclick="deploy()" style="width:100%;margin-top:8px;">🚀 部署合约</button>
+          <div class="hint" style="margin-top:10px;">预览会在状态快照上试跑构造函数，展示将产生的初始状态、事件与转账；参数有问题会在部署前直接指出，可反复调整重新预览。</div>
+          <div class="hint" style="margin-top:6px;">部署后合约地址由交易ID确定性推导，可在「合约交互」页面调用。</div>
           <hr class="divider">
           <div class="section-title">沙箱安全模型</div>
           <div class="small muted" style="line-height:1.9;">
@@ -62,6 +64,16 @@ def get():
             · 状态值 JSON 可序列化 + 键数量上限
           </div>
         </div>
+      </div>
+
+      <div class="card" id="previewCard" style="margin-top:16px;display:none;">
+        <div class="flex">
+          <h2 style="margin:0;">模拟预览结果</h2>
+          <span id="previewStale" class="badge amber sm" style="display:none;">参数已修改，请重新预览</span>
+          <div class="spacer"></div>
+          <span class="hint">在状态快照上试跑，不上链、不耗手续费</span>
+        </div>
+        <div id="previewResult" style="margin-top:10px;"></div>
       </div>
 
       <div class="card" style="margin-top:16px;">
@@ -86,6 +98,12 @@ async function init() {
     localStorage.removeItem("lc_deploy_template");
     autoLoadTemplate(pending);
   }
+  // Any change to code / params / sender invalidates the last preview.
+  ["#constructor", "#deployFee", "#deployFrom"].forEach(sel => {
+    const n = $(sel);
+    if (n) n.addEventListener("input", markPreviewStale);
+  });
+  $("#editor").addEventListener("input", markPreviewStale);
   pollStatus(6000);
 }
 
@@ -145,19 +163,86 @@ function chooseFrom(items) {
   });
 }
 
+function readConstructor() {
+  const raw = $("#constructor").value.trim();
+  if (!raw) return { ok: true, ctor: undefined };
+  let ctor;
+  try { ctor = JSON.parse(raw); } catch (e) { return { ok: false, err: "构造参数不是合法 JSON" }; }
+  if (!Array.isArray(ctor)) return { ok: false, err: "构造参数必须是数组" };
+  return { ok: true, ctor };
+}
+
+function markPreviewStale() {
+  if ($("#previewCard").style.display === "none") return;
+  $("#previewStale").style.display = "";
+}
+
+async function simulateDeploy() {
+  const idx = Number($("#deployFrom").value);
+  const c = readConstructor();
+  if (!c.ok) return toast(c.err, "err");
+  const fee = parseFloat($("#deployFee").value || 0);
+  const body = { code: code(), constructor: c.ctor, fee,
+                 sender: wallets[idx] ? wallets[idx].address : null };
+  let d;
+  try { d = await API.post("/api/contract/simulate_deploy", body); }
+  catch (e) { return toast(e.message, "err"); }
+  renderPreview(d);
+}
+
+function renderPreview(d) {
+  $("#previewCard").style.display = "";
+  $("#previewStale").style.display = "none";
+  const box = $("#previewResult");
+  if (!d.ok) {
+    box.innerHTML = `
+      <div class="badge red">✗ 预览失败：这组参数会导致部署失败</div>
+      <pre class="code" style="margin-top:10px;">${esc(d.error || "未知错误")}</pre>
+      <div class="hint" style="margin-top:6px;">请调整构造参数或代码后重新预览，预览通过后再部署。</div>`;
+    return;
+  }
+  const storage = d.storage || {};
+  const keys = Object.keys(storage);
+  const events = d.events || [];
+  const transfers = d.transfers || [];
+  box.innerHTML = `
+    <div class="flex">
+      <div class="badge green">✓ 预览成功：按当前参数部署将产生以下结果</div>
+      <div class="spacer"></div>
+      <span class="hint">模拟高度 #${d.height} · 合约地址将在部署交易签名后确定</span>
+    </div>
+    <div class="section-title" style="margin-top:12px;">初始状态（${keys.length} 项）</div>
+    ${keys.length ? `<div class="table-wrap"><table><thead><tr><th>键</th><th>值</th></tr></thead>
+      <tbody>${keys.map(k => `<tr><td class="mono">${esc(k)}</td>
+        <td class="mono" style="word-break:break-all;">${esc(JSON.stringify(storage[k]))}</td></tr>`).join("")}
+      </tbody></table></div>`
+      : `<div class="muted small">（构造函数未写入状态）</div>`}
+    <div class="section-title" style="margin-top:12px;">事件（${events.length}）</div>
+    ${events.length ? events.map(e => `
+      <div class="small" style="margin:5px 0;">
+        <span class="badge blue sm">#${e.seq} ${esc(e.event)}</span>
+        <span class="mono" style="font-size:12px;word-break:break-all;">${esc(JSON.stringify(e.data))}</span>
+      </div>`).join("")
+      : `<div class="muted small">（无事件）</div>`}
+    <div class="section-title" style="margin-top:12px;">转账（${transfers.length}）</div>
+    ${transfers.length ? `<div class="table-wrap"><table><thead><tr><th>收款地址</th><th>金额</th></tr></thead>
+      <tbody>${transfers.map(t => `<tr><td class="addr">${esc(t.to)}</td>
+        <td class="mono-num">${fmt.amount(t.amount)}</td></tr>`).join("")}
+      </tbody></table></div>`
+      : `<div class="muted small">（无转账）</div>`}
+    ${d.output ? `<div class="section-title" style="margin-top:12px;">打印输出</div>
+      <pre class="code">${esc(d.output)}</pre>` : ""}`;
+}
+
 async function deploy() {
   const idx = Number($("#deployFrom").value);
   if (!wallets[idx]) return toast("请先生成钱包", "err");
-  let ctor;
-  const raw = $("#constructor").value.trim();
-  if (raw) {
-    try { ctor = JSON.parse(raw); } catch (e) { return toast("构造参数不是合法 JSON", "err"); }
-    if (!Array.isArray(ctor)) return toast("构造参数必须是数组", "err");
-  }
+  const c = readConstructor();
+  if (!c.ok) return toast(c.err, "err");
   const fee = parseFloat($("#deployFee").value || 0);
   try {
     const d = await API.post("/api/contract/deploy",
-      { sender: wallets[idx].address, code: code(), constructor: ctor, fee });
+      { sender: wallets[idx].address, code: code(), constructor: c.ctor, fee });
     if (d.ok) {
       toast("部署交易已提交，合约地址 " + fmt.addr(d.address, 8), "ok");
       toast("提示：请到交易池页面出块以确认部署", "info");
